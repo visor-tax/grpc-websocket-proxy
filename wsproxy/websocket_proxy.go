@@ -33,6 +33,9 @@ type Proxy struct {
 	tokenCookieName     string
 	requestMutator      RequestMutatorFunc
 	headerForwarder     func(header string) bool
+	authCheck           AuthCheckFunction
+	requireAuth         bool
+	proxyCtx            context.Context
 }
 
 // Logger collects log messages.
@@ -110,13 +113,37 @@ func defaultHeaderForwarder(header string) bool {
 //   Authorization: Bearer foobar
 //
 // Method can be overwritten with the MethodOverrideParam get parameter in the requested URL
-func WebsocketProxy(h http.Handler, opts ...Option) http.Handler {
+func WebsocketProxy(ctx context.Context, h http.Handler, opts ...Option) http.Handler {
 	p := &Proxy{
 		h:                   h,
 		logger:              logrus.New(),
 		methodOverrideParam: MethodOverrideParam,
 		tokenCookieName:     TokenCookieName,
 		headerForwarder:     defaultHeaderForwarder,
+		authCheck: func(_ string, _ string) bool {
+			return true
+		},
+		requireAuth: false,
+		proxyCtx:    ctx,
+	}
+	for _, o := range opts {
+		o(p)
+	}
+	return p
+}
+
+type AuthCheckFunction func(token string, ip string) bool
+
+func WebsocketProxyWithAuthCheck(ctx context.Context, h http.Handler, authCheck AuthCheckFunction, opts ...Option) http.Handler {
+	p := &Proxy{
+		h:                   h,
+		logger:              logrus.New(),
+		methodOverrideParam: MethodOverrideParam,
+		tokenCookieName:     TokenCookieName,
+		headerForwarder:     defaultHeaderForwarder,
+		authCheck:           authCheck,
+		requireAuth:         true,
+		proxyCtx:            ctx,
 	}
 	for _, o := range opts {
 		o(p)
@@ -148,6 +175,27 @@ func (p *Proxy) proxy(w http.ResponseWriter, r *http.Request) {
 			"Sec-WebSocket-Protocol": []string{"Bearer"},
 		}
 	}
+	if p.requireAuth {
+		if swsp := r.Header.Get("Sec-WebSocket-Protocol"); swsp != "" {
+			bearerHeader := transformSubProtocolHeader(swsp)
+			if bearerHeader == "" {
+				w.WriteHeader(403)
+				fmt.Fprintln(w, "{\"error\":\"Unauthorized\"}")
+				return
+			}
+			bearerToken := strings.Split(bearerHeader, " ")[1]
+			if !p.authCheck(bearerToken, r.RemoteAddr) {
+				w.WriteHeader(403)
+				fmt.Fprintln(w, "{\"error\":\"Unauthorized\"}")
+				return
+			}
+		} else {
+			w.WriteHeader(403)
+			fmt.Fprintln(w, "{\"error\":\"Unauthorized\"}")
+			return
+		}
+	}
+
 	conn, err := upgrader.Upgrade(w, r, responseHeader)
 	if err != nil {
 		p.logger.Warnln("error upgrading websocket:", err)
@@ -159,7 +207,7 @@ func (p *Proxy) proxy(w http.ResponseWriter, r *http.Request) {
 	defer cancelFn()
 
 	requestBodyR, requestBodyW := io.Pipe()
-	request, err := http.NewRequest(r.Method, r.URL.String(), requestBodyR)
+	request, err := http.NewRequest("POST", r.URL.String(), requestBodyR)
 	if err != nil {
 		p.logger.Warnln("error preparing request:", err)
 		return
@@ -195,6 +243,14 @@ func (p *Proxy) proxy(w http.ResponseWriter, r *http.Request) {
 	}()
 
 	go func() {
+		<-p.proxyCtx.Done()
+		p.logger.Debugln("closing pipes")
+		requestBodyW.CloseWithError(io.EOF)
+		responseBodyW.CloseWithError(io.EOF)
+		response.closed <- true
+	}()
+
+	go func() {
 		defer cancelFn()
 		p.h.ServeHTTP(response, request)
 	}()
@@ -206,6 +262,9 @@ func (p *Proxy) proxy(w http.ResponseWriter, r *http.Request) {
 		}()
 		for {
 			select {
+			case <-p.proxyCtx.Done():
+				p.logger.Debugln("read loop done")
+				return
 			case <-ctx.Done():
 				p.logger.Debugln("read loop done")
 				return
