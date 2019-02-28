@@ -6,7 +6,6 @@ import (
 	"io"
 	"net/http"
 	"strings"
-	"time"
 
 	"github.com/gorilla/websocket"
 	"github.com/sirupsen/logrus"
@@ -269,26 +268,8 @@ func (p *Proxy) proxy(w http.ResponseWriter, r *http.Request) {
 		p.h.ServeHTTP(response, request)
 	}()
 
-	go func() {
-		defer cancelFn()
-		pollingIntervals := time.NewTicker(time.Second / 2)
-		defer pollingIntervals.Stop()
-		for {
-			select {
-			case <-ctx.Done():
-				return
-				// Check if the stream context is closed
-			case <-p.proxyCtx.Done():
-				return
-			case <-pollingIntervals.C:
-				err = conn.WriteControl(websocket.PingMessage, []byte{}, time.Now().Add(time.Second*2))
-				if err != nil {
-					return
-				}
-			}
-		}
-	}()
-
+	// We use a buffered writer because
+	writer := bufio.NewWriter(requestBodyW)
 	// read loop -- take messages from websocket and write to http request
 	go func() {
 		defer func() {
@@ -316,8 +297,9 @@ func (p *Proxy) proxy(w http.ResponseWriter, r *http.Request) {
 			}
 			p.logger.Debugln("[read] read payload:", string(payload))
 			p.logger.Debugln("[read] writing to requestBody:")
-			n, err := requestBodyW.Write(payload)
-			requestBodyW.Write([]byte("\n"))
+			n, err := writer.Write(payload)
+			writer.Write([]byte("\n"))
+			go writer.Flush()
 			p.logger.Debugln("[read] wrote to requestBody", n)
 			if err != nil {
 				p.logger.Warnln("[read] error writing message to upstream http server:", err)
