@@ -6,6 +6,7 @@ import (
 	"io"
 	"net/http"
 	"strings"
+	"time"
 
 	"github.com/gorilla/websocket"
 	"github.com/sirupsen/logrus"
@@ -153,8 +154,8 @@ func WebsocketProxyWithAuthCheck(ctx context.Context, h http.Handler, authCheck 
 
 // TODO(tmc): allow modification of upgrader settings?
 var upgrader = websocket.Upgrader{
-	ReadBufferSize:  1024,
-	WriteBufferSize: 1024,
+	ReadBufferSize:  15 << (10 * 2),
+	WriteBufferSize: 15 << (10 * 2),
 	CheckOrigin:     func(r *http.Request) bool { return true },
 }
 
@@ -206,6 +207,11 @@ func (p *Proxy) proxy(w http.ResponseWriter, r *http.Request) {
 	ctx, cancelFn := context.WithCancel(context.Background())
 	defer cancelFn()
 
+	conn.SetCloseHandler(func(code int, reason string) error {
+		cancelFn()
+		return nil
+	})
+
 	requestBodyR, requestBodyW := io.Pipe()
 	request, err := http.NewRequest("POST", r.URL.String(), requestBodyR)
 	if err != nil {
@@ -251,8 +257,36 @@ func (p *Proxy) proxy(w http.ResponseWriter, r *http.Request) {
 	}()
 
 	go func() {
+		<-r.Context().Done()
+		p.logger.Debugln("closing pipes")
+		requestBodyW.CloseWithError(io.EOF)
+		responseBodyW.CloseWithError(io.EOF)
+		response.closed <- true
+	}()
+
+	go func() {
 		defer cancelFn()
 		p.h.ServeHTTP(response, request)
+	}()
+
+	go func() {
+		defer cancelFn()
+		pollingIntervals := time.NewTicker(time.Second / 2)
+		defer pollingIntervals.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+				// Check if the stream context is closed
+			case <-p.proxyCtx.Done():
+				return
+			case <-pollingIntervals.C:
+				err = conn.WriteControl(websocket.PingMessage, []byte{}, time.Now().Add(time.Second*2))
+				if err != nil {
+					return
+				}
+			}
+		}
 	}()
 
 	// read loop -- take messages from websocket and write to http request
@@ -292,20 +326,32 @@ func (p *Proxy) proxy(w http.ResponseWriter, r *http.Request) {
 		}
 	}()
 	// write loop -- take messages from response and write to websocket
-	scanner := bufio.NewScanner(responseBodyR)
-	for scanner.Scan() {
-		if len(scanner.Bytes()) == 0 {
-			p.logger.Warnln("[write] empty scan", scanner.Err())
-			continue
+	scanner := bufio.NewReader(responseBodyR)
+	for {
+		select {
+		case <-p.proxyCtx.Done():
+			p.logger.Debugln("read loop done")
+			return
+		case <-ctx.Done():
+			p.logger.Debugln("read loop done")
+			return
+		default:
 		}
-		p.logger.Debugln("[write] scanned", scanner.Text())
-		if err = conn.WriteMessage(websocket.TextMessage, scanner.Bytes()); err != nil {
+		line, isPrefix, err := scanner.ReadLine()
+		if err != nil {
+			return
+		}
+		p.logger.Debugln("[write] scanned", string(line))
+		if err = conn.WriteMessage(websocket.TextMessage, line); err != nil {
 			p.logger.Warnln("[write] error writing websocket message:", err)
 			return
 		}
-	}
-	if err := scanner.Err(); err != nil {
-		p.logger.Warnln("scanner err:", err)
+		if !isPrefix {
+			if err = conn.WriteMessage(websocket.TextMessage, []byte{'\n'}); err != nil {
+				p.logger.Warnln("[write] error writing websocket message:", err)
+				return
+			}
+		}
 	}
 }
 
