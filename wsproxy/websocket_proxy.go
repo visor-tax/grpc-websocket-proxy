@@ -268,7 +268,6 @@ func (p *Proxy) proxy(w http.ResponseWriter, r *http.Request) {
 		p.h.ServeHTTP(response, request)
 	}()
 
-	// We use a buffered writer because
 	writer := bufio.NewWriter(requestBodyW)
 	// read loop -- take messages from websocket and write to http request
 	go func() {
@@ -295,6 +294,7 @@ func (p *Proxy) proxy(w http.ResponseWriter, r *http.Request) {
 				p.logger.Warnln("error reading websocket message:", err)
 				return
 			}
+
 			p.logger.Debugln("[read] read payload:", string(payload))
 			p.logger.Debugln("[read] writing to requestBody:")
 			n, err := writer.Write(payload)
