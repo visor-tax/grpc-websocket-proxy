@@ -291,7 +291,7 @@ func (p *Proxy) proxy(w http.ResponseWriter, r *http.Request) {
 					p.logger.Debugln("[read] websocket closed:", err)
 					return
 				}
-				p.logger.Warnln("error reading websocket message:", err)
+				p.logger.Debugln("error reading websocket message:", err)
 				return
 			}
 
